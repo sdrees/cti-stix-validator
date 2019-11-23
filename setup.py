@@ -19,7 +19,8 @@ def get_version():
 install_requires = [
     'appdirs',
     'colorama',
-    'jsonschema==2.5.1',
+    'cpe',
+    'jsonschema>=2.5.1',
     'python-dateutil',
     'requests',
     'requests_cache',
@@ -30,17 +31,35 @@ install_requires = [
 
 setup(
     name='stix2-validator',
-    description='APIs and scripts for validating STIX 2.0 documents.',
-    url='http://cti-tc.github.io/',
     version=get_version(),
-    packages=find_packages(),
+    description='APIs and scripts for validating STIX 2.0 documents.',
+    long_description=readme,
+    long_description_content_type='text/x-rst',
+    url="https://github.com/oasis-open/cti-stix-validator",
+    author='OASIS Cyber Threat Intelligence Technical Committee',
+    author_email='cti-users@lists.oasis-open.org',
+    maintainer='Chris Lenk',
+    maintainer_email='clenk@mitre.org',
+    classifiers=[
+        'Development Status :: 4 - Beta',
+        'Topic :: Security',
+        'License :: OSI Approved :: BSD License',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+    ],
+    keywords="stix stix2 json validation validator stix-validator stix2-validator",
+    packages=find_packages(exclude=['*.test.*']),
+    install_requires=install_requires,
+    include_package_data=True,
     entry_points={
         'console_scripts': [
             'stix2_validator = stix2validator.scripts.stix2_validator:main',
         ],
     },
-    include_package_data=True,
-    install_requires=install_requires,
-    long_description=readme,
-    keywords="stix stix2 json validation validator stix-validator stix2-validator"
 )

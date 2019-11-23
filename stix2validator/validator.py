@@ -5,16 +5,29 @@ from collections import Iterable
 import io
 from itertools import chain
 import os
+import sys
 
-from jsonschema import Draft4Validator, RefResolver
+from jsonschema import Draft7Validator, RefResolver
 from jsonschema import exceptions as schema_exceptions
+from jsonschema.validators import extend
 import simplejson as json
 from six import iteritems, string_types, text_type
 
-from . import musts, output, shoulds
+from . import output
 from .errors import (NoJSONFileFoundError, SchemaError, SchemaInvalidError,
                      ValidationError, pretty_error)
-from .util import ValidationOptions
+from .util import (DEFAULT_VER, ValidationOptions, check_spec,
+                   clear_requests_cache, init_requests_cache)
+from .v20 import musts as musts20
+from .v20 import shoulds as shoulds20
+from .v21 import musts as musts21
+from .v21 import shoulds as shoulds21
+
+try:
+    FileNotFoundError
+except NameError:
+    # Python 2
+    FileNotFoundError = IOError
 
 
 def _is_iterable_non_string(val):
@@ -172,6 +185,11 @@ class FileValidationResults(BaseResults):
         else:
             self._object_results = [object_results]
 
+    def log(self):
+        """Print (log) these file validation results.
+        """
+        output.print_file_results(self)
+
 
 class ObjectValidationResults(BaseResults):
     """Results of JSON schema validation for a single STIX object.
@@ -188,10 +206,12 @@ class ObjectValidationResults(BaseResults):
     Attributes:
         is_valid: ``True`` if the validation was successful and ``False``
             otherwise.
+        object_id: ID of the STIX object.
 
     """
-    def __init__(self, is_valid=False, errors=None, warnings=None):
+    def __init__(self, is_valid=False, object_id=None, errors=None, warnings=None):
         super(ObjectValidationResults, self).__init__(is_valid)
+        self.object_id = object_id
         self.errors = errors
         self.warnings = warnings
 
@@ -228,6 +248,11 @@ class ObjectValidationResults(BaseResults):
             d['errors'] = [x.as_dict() for x in self.errors]
 
         return d
+
+    def log(self):
+        """Print (log) these file validation results.
+        """
+        output.print_object_results(self)
 
 
 class ValidationErrorResults(BaseResults):
@@ -274,9 +299,10 @@ def list_json_files(directory, recursive=False):
     """
     json_files = []
 
-    for top, _, files in os.walk(directory):
+    for top, dirs, files in os.walk(directory):
+        dirs.sort()
         # Get paths to each file in `files`
-        paths = (os.path.join(top, f) for f in files)
+        paths = (os.path.join(top, f) for f in sorted(files))
 
         # Add all the .json files to our return collection
         json_files.extend(x for x in paths if is_json(x))
@@ -328,11 +354,13 @@ def run_validation(options):
             this validation run.
 
     """
-    # The JSON files to validate
-    try:
-        files = get_json_files(options.files, options.recursive)
-    except NoJSONFileFoundError as e:
-        output.error(e.message)
+    if options.files == sys.stdin:
+        results = validate(options.files, options)
+        return [FileValidationResults(is_valid=results.is_valid,
+                                      filepath='stdin',
+                                      object_results=results)]
+
+    files = get_json_files(options.files, options.recursive)
 
     results = [validate_file(fn, options) for fn in files]
 
@@ -358,25 +386,31 @@ def validate_parsed_json(obj_json, options=None):
     if not options:
         options = ValidationOptions()
 
-    results = None
-    try:
-        if validating_list:
-            # Doing it this way instead of using a comprehension means that
-            # initial validation results will be retained, even if a later
-            # exception aborts the sequence.
-            results = []
-            for obj in obj_json:
-                results.append(validate_instance(obj, options))
-        else:
-            results = validate_instance(obj_json, options)
+    if not options.no_cache:
+        init_requests_cache(options.refresh_cache)
 
-    except SchemaInvalidError as ex:
-        error_result = ObjectValidationResults(is_valid=False,
-                                               errors=[str(ex)])
-        if validating_list:
-            results.append(error_result)
-        else:
+    results = None
+    if validating_list:
+        results = []
+        for obj in obj_json:
+            try:
+                results.append(validate_instance(obj, options))
+            except SchemaInvalidError as ex:
+                error_result = ObjectValidationResults(is_valid=False,
+                                                       object_id=obj.get('id', ''),
+                                                       errors=[str(ex)])
+                results.append(error_result)
+    else:
+        try:
+            results = validate_instance(obj_json, options)
+        except SchemaInvalidError as ex:
+            error_result = ObjectValidationResults(is_valid=False,
+                                                   object_id=obj_json.get('id', ''),
+                                                   errors=[str(ex)])
             results = error_result
+
+    if not options.no_cache and options.clear_cache:
+        clear_requests_cache()
 
     return results
 
@@ -433,8 +467,9 @@ def validate_file(fn, options=None):
                "validation will be performed: {error}")
         output.info(msg.format(fn=fn, error=str(ex)))
 
-    file_results.is_valid = all(object_result.is_valid
-                                for object_result in file_results.object_results)
+    file_results.is_valid = (all(object_result.is_valid
+                                 for object_result in file_results.object_results)
+                             and not file_results.fatal)
 
     return file_results
 
@@ -458,6 +493,40 @@ def validate_string(string, options=None):
     return validate(stream, options)
 
 
+SCHEMA_STORE = {}
+
+
+def ref_store(validator, ref, instance, schema):
+    """When validating '$ref' properties, add to global store.
+    """
+    remote_path = validator.resolver._urljoin_cache(validator.resolver.base_uri, ref)
+
+    if remote_path not in validator.resolver.store:
+        # Add local schema to Resolver store if present, so validator will use local
+        # schemas and only download remote refs in local is not present.
+        local_base_uri = validator.resolver._scopes_stack[0]
+
+        # Take out the the 'file:' prefix
+        if os.name == 'nt':
+            local_base_uri = local_base_uri[8:]
+        else:
+            local_base_uri = local_base_uri[5:]
+
+        try:
+            local_filepath = os.path.abspath(os.path.join(local_base_uri, '../'+ref))
+            local_schema = load_schema(local_filepath)
+            schema_id = local_schema.get('$id', '')
+            if schema_id:
+                validator.resolver.store[schema_id] = local_schema
+        except FileNotFoundError:
+            pass
+
+    return Draft7Validator.VALIDATORS['$ref'](validator, ref, instance, schema)
+
+
+STIXValidator = extend(Draft7Validator, {'$ref': ref_store})
+
+
 def load_validator(schema_path, schema):
     """Create a JSON schema validator for the given schema.
 
@@ -466,18 +535,24 @@ def load_validator(schema_path, schema):
         schema: A Python object representation of the same schema.
 
     Returns:
-        An instance of Draft4Validator.
+        An instance of Draft7Validator.
 
     """
+    global SCHEMA_STORE
+
     # Get correct prefix based on OS
     if os.name == 'nt':
         file_prefix = 'file:///'
     else:
         file_prefix = 'file:'
 
-    resolver = RefResolver(file_prefix + schema_path.replace("\\", "/"), schema)
-    validator = Draft4Validator(schema, resolver=resolver)
-
+    resolver = RefResolver(file_prefix + schema_path.replace("\\", "/"), schema, store=SCHEMA_STORE)
+    schema_id = schema.get('$id', '')
+    if schema_id:
+        resolver.store[schema_id] = schema
+    # RefResolver creates a new store internally; persist it so we can use the same mappings every time
+    SCHEMA_STORE = resolver.store
+    validator = STIXValidator(schema, resolver=resolver)
     return validator
 
 
@@ -486,7 +561,10 @@ def find_schema(schema_dir, obj_type):
     Return the file path of the first match it finds.
     """
     schema_filename = obj_type + '.json'
+
     for root, dirnames, filenames in os.walk(schema_dir):
+        if "examples" in root:
+            continue
         if schema_filename in filenames:
             return os.path.join(root, schema_filename)
 
@@ -511,30 +589,48 @@ def load_schema(schema_path):
     return schema
 
 
-def _schema_validate(sdo, options):
-    """Set up validation of a single STIX object against its type's schema.
-    This does no actual validation; it just returns generators which must be
-    iterated to trigger the actual generation.
+def _get_error_generator(type, obj, schema_dir=None, version=DEFAULT_VER, default='core'):
+    """Get a generator for validating against the schema for the given object type.
 
-    Do not call this function directly; use validate_instance() instead, as it
-    calls this one. This function does not perform any custom checks.
+    Args:
+        type (str): The object type to find the schema for.
+        obj: The object to be validated.
+        schema_dir (str): The path in which to search for schemas.
+        version (str): The version of the STIX specification to validate
+            against. Only used to find base schemas when schema_dir is None.
+        default (str): If the schema for the given type cannot be found, use
+            the one with this name instead.
+
+    Returns:
+        A generator for errors found when validating the object against the
+        appropriate schema, or None if schema_dir is None and the schema
+        cannot be found.
     """
+    # If no schema directory given, use default for the given STIX version,
+    # which comes bundled with this package
+    if schema_dir is None:
+        schema_dir = os.path.abspath(os.path.dirname(__file__) + '/schemas-'
+                                     + version + '/')
+
     try:
-        sdo_schema_path = find_schema(options.schema_dir, sdo['type'])
-        sdo_schema = load_schema(sdo_schema_path)
+        schema_path = find_schema(schema_dir, type)
+        schema = load_schema(schema_path)
     except (KeyError, TypeError):
         # Assume a custom object with no schema
         try:
-            sdo_schema_path = find_schema(options.schema_dir, 'core')
-            sdo_schema = load_schema(sdo_schema_path)
+            schema_path = find_schema(schema_dir, default)
+            schema = load_schema(schema_path)
         except (KeyError, TypeError):
-            raise SchemaInvalidError("Cannot locate a schema for the "
-                                     "object's type, nor the base "
-                                     "schema (core.json).")
+            # Only raise an error when checking against default schemas, not custom
+            if schema_dir is not None:
+                return None
+            raise SchemaInvalidError("Cannot locate a schema for the object's "
+                                     "type, nor the base schema ({}.json).".format(default))
 
-    if sdo['type'] == 'observed-data':
-        # Validate against schemas for specific object types later
-        sdo_schema['allOf'][1]['properties']['objects'] = {
+    if type == 'observed-data' and schema_dir is None:
+        # Validate against schemas for specific observed data object types later.
+        # If schema_dir is not None the schema is custom and won't need to be modified.
+        schema['allOf'][1]['properties']['objects'] = {
             "objects": {
                 "type": "object",
                 "minProperties": 1
@@ -542,12 +638,53 @@ def _schema_validate(sdo, options):
         }
 
     # Don't use custom validator; only check schemas, no additional checks
-    sdo_validator = load_validator(sdo_schema_path, sdo_schema)
+    validator = load_validator(schema_path, schema)
     try:
-        sdo_errors = sdo_validator.iter_errors(sdo)
+        error_gen = validator.iter_errors(obj)
     except schema_exceptions.RefResolutionError:
         raise SchemaInvalidError('Invalid JSON schema: a JSON '
                                  'reference failed to resolve')
+    return error_gen
+
+
+def _get_musts(options):
+    """Return the list of 'MUST' validators for the correct version of STIX.
+
+    Args:
+        options: ValidationOptions instance with validation options for this
+            validation run, including the STIX spec version.
+    """
+    if options.version == '2.0':
+        return musts20.list_musts(options)
+    else:
+        return musts21.list_musts(options)
+
+
+def _get_shoulds(options):
+    """Return the list of 'SHOULD' validators for the correct version of STIX.
+
+    Args:
+        options: ValidationOptions instance with validation options for this
+            validation run, including the STIX spec version.
+    """
+    if options.version == '2.0':
+        return shoulds20.list_shoulds(options)
+    else:
+        return shoulds21.list_shoulds(options)
+
+
+def _schema_validate(sdo, options):
+    """Set up validation of a single STIX object against its type's schema.
+    This does no actual validation; it just returns generators which must be
+    iterated to trigger the actual generation.
+
+    This function first creates generators for the built-in schemas, then adds
+    generators for additional schemas from the options, if specified.
+
+    Do not call this function directly; use validate_instance() instead, as it
+    calls this one. This function does not perform any custom checks.
+    """
+    error_gens = []
 
     if 'id' in sdo:
         try:
@@ -556,33 +693,59 @@ def _schema_validate(sdo, options):
             error_prefix = 'unidentifiable object: '
     else:
         error_prefix = ''
-    error_gens = [(sdo_errors, error_prefix)]
+
+    if options.version:
+        version = options.version
+    elif options.version is None and 'spec_version' in sdo:
+        version = sdo['spec_version']
+    else:
+        version = DEFAULT_VER
+
+    options.set_check_codes(version)
+
+    # Get validator for built-in schema
+    base_sdo_errors = _get_error_generator(sdo['type'], sdo, version=version)
+    if base_sdo_errors:
+        error_gens.append((base_sdo_errors, error_prefix))
+
+    # Get validator for any user-supplied schema
+    if options.schema_dir:
+        custom_sdo_errors = _get_error_generator(sdo['type'], sdo, options.schema_dir)
+        if custom_sdo_errors:
+            error_gens.append((custom_sdo_errors, error_prefix))
 
     # Validate each cyber observable object separately
     if sdo['type'] == 'observed-data' and 'objects' in sdo:
-        for key, obj in iteritems(sdo['objects']):
-            try:
-                obj_schema_path = find_schema(options.schema_dir, obj['type'])
-                obj_schema = load_schema(obj_schema_path)
-            except (KeyError, TypeError):
-                # Assume a custom object with no schema
-                try:
-                    obj_schema_path = find_schema(options.schema_dir,
-                                                  'cyber-observable-core')
-                    obj_schema = load_schema(obj_schema_path)
-                except (KeyError, TypeError):
-                    raise SchemaInvalidError("Cannot locate a schema for the "
-                                             "object's type, nor the base "
-                                             "schema (core.json).")
+        # Check if observed data property is in dictionary format
+        if not isinstance(sdo['objects'], dict):
+            error_gens.append(([schema_exceptions.ValidationError("Observed Data objects must be in dict format.", error_prefix)],
+                              error_prefix))
+            return error_gens
 
-            obj_validator = load_validator(obj_schema_path, obj_schema)
-            try:
-                obj_errors = obj_validator.iter_errors(obj)
-            except schema_exceptions.RefResolutionError:
-                raise SchemaInvalidError('Invalid JSON schema: a JSON '
-                                         'reference failed to resolve')
-            error_gens.append((obj_errors,
-                               error_prefix + 'object \'' + key + '\': '))
+        for key, obj in iteritems(sdo['objects']):
+            if 'type' not in obj:
+                error_gens.append(([schema_exceptions.ValidationError("Observable object must contain a 'type' property.", error_prefix)],
+                                   error_prefix + 'object \'' + key + '\': '))
+                continue
+            # Get validator for built-in schemas
+            base_obs_errors = _get_error_generator(obj['type'],
+                                                   obj,
+                                                   None,
+                                                   version,
+                                                   'cyber-observable-core')
+            if base_obs_errors:
+                error_gens.append((base_obs_errors,
+                                   error_prefix + 'object \'' + key + '\': '))
+
+            # Get validator for any user-supplied schema
+            custom_obs_errors = _get_error_generator(obj['type'],
+                                                     obj,
+                                                     options.schema_dir,
+                                                     version,
+                                                     'cyber-observable-core')
+            if custom_obs_errors:
+                error_gens.append((custom_obs_errors,
+                                   error_prefix + 'object \'' + key + '\': '))
 
     return error_gens
 
@@ -612,16 +775,21 @@ def validate_instance(instance, options=None):
     error_gens = []
 
     # Schema validation
+    error_gens += _schema_validate(instance, options)
     if instance['type'] == 'bundle' and 'objects' in instance:
+        if options.version is None and 'spec_version' in instance:
+            options.version = instance['spec_version']
         # Validate each object in a bundle separately
         for sdo in instance['objects']:
+            if 'type' not in sdo:
+                raise ValidationError("Each object in bundle must have a 'type' property.")
             error_gens += _schema_validate(sdo, options)
-    else:
-        error_gens += _schema_validate(instance, options)
+
+    spec_warnings = check_spec(instance, options)
 
     # Custom validation
-    must_checks = musts.list_musts(options)
-    should_checks = shoulds.list_shoulds(options)
+    must_checks = _get_musts(options)
+    should_checks = _get_shoulds(options)
     output.info("Running the following additional checks: %s."
                 % ", ".join(x.__name__ for x in chain(must_checks, should_checks)))
     try:
@@ -634,6 +802,7 @@ def validate_instance(instance, options=None):
         else:
             chained_errors = errors
             warnings = [pretty_error(x, options.verbose) for x in warnings]
+            warnings.extend(spec_warnings)
     except schema_exceptions.RefResolutionError:
         raise SchemaInvalidError('Invalid JSON schema: a JSON reference '
                                  'failed to resolve')
@@ -649,11 +818,11 @@ def validate_instance(instance, options=None):
         for error in gen:
             msg = prefix + pretty_error(error, options.verbose)
             error_list.append(SchemaError(msg))
-
+    if options.strict:
+        error_list.extend(spec_warnings)
     if error_list:
         valid = False
     else:
         valid = True
-
-    return ObjectValidationResults(is_valid=valid, errors=error_list,
-                                   warnings=warnings)
+    return ObjectValidationResults(is_valid=valid, object_id=instance.get('id', ''),
+                                   errors=error_list, warnings=warnings)
