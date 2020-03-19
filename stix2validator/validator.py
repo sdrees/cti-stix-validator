@@ -5,9 +5,10 @@ from collections import Iterable
 import io
 from itertools import chain
 import os
+import re
 import sys
 
-from jsonschema import Draft7Validator, RefResolver
+from jsonschema import Draft7Validator, RefResolver, draft7_format_checker
 from jsonschema import exceptions as schema_exceptions
 from jsonschema.validators import extend
 import simplejson as json
@@ -28,6 +29,9 @@ try:
 except NameError:
     # Python 2
     FileNotFoundError = IOError
+
+
+EMAIL_RE = re.compile(r'(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)')
 
 
 def _is_iterable_non_string(val):
@@ -527,6 +531,14 @@ def ref_store(validator, ref, instance, schema):
 STIXValidator = extend(Draft7Validator, {'$ref': ref_store})
 
 
+# Built-in checker only ensures emails contain an '@'; we want a more robust check
+@draft7_format_checker.checks('email')
+def is_email(instance):
+    if not isinstance(instance, string_types):
+        return True
+    return EMAIL_RE.match(instance)
+
+
 def load_validator(schema_path, schema):
     """Create a JSON schema validator for the given schema.
 
@@ -552,7 +564,7 @@ def load_validator(schema_path, schema):
         resolver.store[schema_id] = schema
     # RefResolver creates a new store internally; persist it so we can use the same mappings every time
     SCHEMA_STORE = resolver.store
-    validator = STIXValidator(schema, resolver=resolver)
+    validator = STIXValidator(schema, resolver=resolver, format_checker=draft7_format_checker)
     return validator
 
 
