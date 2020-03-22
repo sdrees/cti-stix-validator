@@ -81,20 +81,27 @@ INDUSTRY_SECTOR_OV = [
     "agriculture",
     "aerospace",
     "automotive",
+    "chemical",
+    "commercial",
     "communications",
     "construction",
-    "defence",
+    "defense",
     "education",
     "energy",
     "entertainment",
     "financial-services",
-    "government-national",
-    "government-regional",
+    "government",
+    "emergency-services",
     "government-local",
+    "government-national",
     "government-public-services",
+    "government-regional",
     "healthcare",
     "hospitality-leisure",
     "infrastructure",
+    "dams",
+    "nuclear",
+    "water",
     "insurance",
     "manufacturing",
     "mining",
@@ -117,7 +124,7 @@ INFRASTRUCTURE_TYPE_OV = [
     "phishing",
     "reconnaissance",
     "staging",
-    "undefined",
+    "unknown",
 ]
 MALWARE_AV_RESULT_OV = [
     "malicious",
@@ -1163,6 +1170,7 @@ OBSERVABLE_PROPERTIES = {
         'extensions',
         'name',
         'cpe',
+        'swid',
         'languages',
         'vendor',
         'version',
@@ -2066,13 +2074,6 @@ VOCAB_PROPERTIES = {
 }
 
 DEPRECATED_PROPERTIES = {
-    'domain-name': ['resolves_to_refs'],
-    'ipv4-addr': [
-        'resolves_to_refs',
-        'belongs_to_refs'],
-    'ipv6-addr': [
-        'resolves_to_refs'
-        'belongs_to_refs'],
     'observed-data': ['objects'],
 }
 
