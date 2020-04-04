@@ -4,6 +4,7 @@ import operator
 import re
 import uuid
 
+from cpe import CPE
 from dateutil import parser
 from six import string_types
 from stix2patterns.v21.pattern import Pattern
@@ -474,6 +475,20 @@ def patterns(instance, options):
                                    "should start with 'x_'" % prop, instance['id'])
 
 
+def cpe_check(instance):
+    """Checks to see if provided cpe is a valid CPE v2.3 entry
+    """
+    if 'cpe' not in instance:
+        return
+    try:
+        CPE(instance['cpe'], CPE.VERSION_2_3)
+    except NotImplementedError:
+        yield JSONError(
+                "Provided CPE value '%s' is not CPE v2.3 compliant." %
+                instance['cpe'], instance['id'],
+        )
+
+
 def language_contents(instance):
     """Ensure keys in Language Content's 'contents' dictionary are valid
     language codes, and that the keys in the sub-dictionaries match the rules
@@ -543,9 +558,10 @@ def list_musts(options):
         language,
         software_language,
         patterns,
+        cpe_check,
         language_contents,
         uuid_version_check,
-        process
+        process,
     ]
 
     return validator_list
